@@ -133,6 +133,43 @@ LibreChat connects to 4 custom endpoints (configured in `config/librechat.yaml`)
 | Deep Research | `miroflow` | 9200 |
 | Swarm Deep Search | `swarm-miroflow` | 9500 |
 
+## Optional Parallel web search
+
+The multi-source general search in `proxies/search_providers.py` can supplement
+its existing providers with [Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp).
+Anonymous search uses Fast mode and needs no account or API key. It is free for
+exploration and light use, with service rate limits.
+
+Set `PARALLEL_SEARCH_ENABLED=true` in the environment of the process running the
+multi-source search tools, then restart that process. Leave it unset or `false`
+to keep the existing behavior. Parallel results follow the existing providers
+and use the same URL deduplication and result limit. Errors or a 20-second
+timeout leave the other providers' results available.
+
+This applies to general searches through `search_as_raw` / `multi_search`,
+including the legacy `tools.search_tools` path. Time-filtered searches,
+specialized categories, site searches, standalone provider MCP servers and
+Strands' separate tools keep their existing routing. This provider uses MCP's
+Streamable HTTP transport; it does not change page fetching.
+
+To try the multi-source API from the repository root with Python 3.10+:
+
+```bash
+python -m venv /tmp/portal-search
+. /tmp/portal-search/bin/activate
+python -m pip install 'mcp>=1.10.0,<2' httpx fastapi
+PYTHONPATH=proxies PARALLEL_SEARCH_ENABLED=true python - <<'PY'
+import asyncio
+import json
+from search_providers import search_as_raw
+
+print(json.dumps(asyncio.run(search_as_raw("Python asyncio TaskGroup documentation")), indent=2))
+PY
+```
+
+Existing providers also run in this example when available. Full portal
+installations should use `requirements.txt` as usual.
+
 ## Knowledge Engine
 
 A standalone Neo4j-centric microservice for ingesting large text corpora, extracting knowledge with multi-pass LLM extraction, and performing graph-based discovery.

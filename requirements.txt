@@ -18,7 +18,7 @@ deepagents>=0.5.2
 
 # --- New Framework Dependencies (MCP-based architecture) ---
 litellm[proxy]>=1.40.0
-mcp>=1.0.0              # Model Context Protocol SDK (Anthropic's official Python SDK)
+mcp>=1.10.0,<2          # Streamable HTTP client and structured tool results (v1 SDK)
 fastmcp>=0.5.0           # FastMCP — high-level MCP server framework
 
 # --- Search Providers ---

@@ -11,6 +11,7 @@ independent sources directly:
   4. **SearXNG** — kept as fallback for categories not covered by direct sources
   5. **Exa** (via direct HTTP API) — semantic/neural AI search, needs API key
   6. **Firecrawl** (via direct HTTP API) — deep web scraping with search, needs API key
+  7. **Parallel** (via Search MCP) — optional keyless general web search
 
 Each provider returns normalised ``SearchResult`` dicts. The ``multi_search``
 coroutine fans out to all available providers concurrently and deduplicates
@@ -48,6 +49,14 @@ EXA_API_KEY = os.getenv("EXA_API_KEY", "")
 # Feature flag: set to "0" or "false" to disable SearXNG entirely
 SEARXNG_ENABLED = os.getenv("SEARXNG_ENABLED", "1").lower() not in ("0", "false", "no")
 
+# Opt in explicitly: existing search routing makes no Parallel requests by default.
+PARALLEL_SEARCH_ENABLED = os.getenv("PARALLEL_SEARCH_ENABLED", "0").lower() in ("1", "true", "yes")
+_PARALLEL_MCP_URL = "https://search.parallel.ai/mcp"
+_PARALLEL_USER_AGENT = (
+    "deep-search-portal/parallel-search (+https://github.com/OrpingtonClose/deep-search-portal)"
+)
+_PARALLEL_TIMEOUT = 20.0
+
 
 # ---------------------------------------------------------------------------
 # Normalised result type
@@ -59,7 +68,7 @@ class SearchResult:
     title: str
     url: str
     snippet: str
-    source: str  # provider name: "duckduckgo", "brave", "exa", "firecrawl", "mojeek", "searxng"
+    source: str  # provider name, e.g. "duckduckgo", "brave", "parallel", "searxng"
     score: float = 0.0  # optional relevance score
     published_date: str = ""  # ISO date if available
     img_src: str = ""         # Direct image URL (for image search results)
@@ -79,6 +88,82 @@ class SearchResult:
         if self.thumbnail_src:
             d["thumbnail_src"] = self.thumbnail_src
         return d
+
+
+# ---------------------------------------------------------------------------
+# Provider: Parallel (anonymous Streamable HTTP MCP)
+# ---------------------------------------------------------------------------
+
+async def _search_parallel(query: str, max_results: int = 10) -> list[SearchResult]:
+    """Supplement general search with Parallel's opt-in, keyless Search MCP."""
+    if not PARALLEL_SEARCH_ENABLED or max_results <= 0:
+        return []
+
+    try:
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+
+        async def _call():
+            async with streamablehttp_client(
+                _PARALLEL_MCP_URL,
+                headers={"User-Agent": _PARALLEL_USER_AGENT},
+                timeout=_PARALLEL_TIMEOUT,
+                sse_read_timeout=_PARALLEL_TIMEOUT,
+            ) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    return await session.call_tool(
+                        "web_search", {"objective": query, "search_queries": [query]},
+                    )
+
+        # Bound the whole operation, including connection, initialization and cleanup.
+        response = await asyncio.wait_for(_call(), timeout=_PARALLEL_TIMEOUT)
+        if response.isError:
+            log.warning("Parallel search returned a tool error")
+            return []
+
+        data = response.structuredContent
+        if data is None:
+            # Older MCP servers may expose the JSON only in text content.
+            for block in response.content:
+                if block.type == "text":
+                    try:
+                        candidate = json.loads(block.text)
+                    except ValueError:
+                        continue
+                    if isinstance(candidate, dict) and "results" in candidate:
+                        data = candidate
+                        break
+        if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+            raise ValueError("Parallel response has no results list")
+
+        results = []
+        for item in data["results"]:
+            if not isinstance(item, dict):
+                continue
+            url = item.get("url")
+            if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+                continue
+            excerpts = item.get("excerpts")
+            snippet = ""
+            if isinstance(excerpts, list):
+                snippet = "\n".join(text for text in excerpts if isinstance(text, str))
+            published_date = item.get("publish_date")
+            results.append(SearchResult(
+                title=item.get("title") if isinstance(item.get("title"), str) else url,
+                url=url,
+                snippet=snippet[:500],
+                source="parallel",
+                published_date=published_date if isinstance(published_date, str) else "",
+            ))
+            if len(results) >= max_results:
+                break
+        return results
+
+    except Exception as e:
+        # Match the other providers' fail-open behavior. CancelledError propagates.
+        log.warning(f"Parallel search error: {e}")
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -455,8 +540,9 @@ async def multi_search(
     Provider priority (results listed first have higher placement):
       1. DuckDuckGo (always available, free)
       2. Brave (if API key configured)
-      3. Mojeek (if API key configured)
-      4. SearXNG (fallback, if enabled)
+      3. Exa, Firecrawl, Mojeek (if API keys configured)
+      4. SearXNG (if enabled)
+      5. Parallel (if explicitly enabled, without a time_range)
 
     Results are deduplicated by normalised URL.
     """
@@ -471,6 +557,10 @@ async def multi_search(
 
     if include_news:
         tasks.append(_search_duckduckgo_news(query, max_results))
+
+    # MCP has no time-range filter; keep time-filtered searches on existing routes.
+    if PARALLEL_SEARCH_ENABLED and not time_range:
+        tasks.append(_search_parallel(query, max_results))
 
     gathered = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -704,4 +794,5 @@ def available_providers() -> dict[str, bool]:
         "firecrawl": bool(FIRECRAWL_API_KEY),
         "mojeek": bool(MOJEEK_API_KEY),
         "searxng": SEARXNG_ENABLED,
+        "parallel": PARALLEL_SEARCH_ENABLED,
     }
